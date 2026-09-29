@@ -1,0 +1,205 @@
+import pandas as pd
+import numpy as np
+import meshio
+import torch
+import tensorflow as tf
+import os
+
+from matplotlib import colors, tri as mtri
+from matplotlib.animation import FuncAnimation
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+import matplotlib.pyplot as plt
+from sklearn.manifold import Isomap
+from torch_geometric.data import Data 
+
+from sklearn.preprocessing import LabelEncoder,MinMaxScaler
+from sklearn.metrics import mean_squared_error
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dropout,Dense, LSTM, InputLayer
+from tensorflow.keras.losses import MeanSquaredError
+from tensorflow.keras.metrics import RootMeanSquaredError
+from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.optimizers import Adam
+import tensorflow.compat.v1 as tf 
+
+import matplotlib.pyplot as plt
+from math import sqrt
+
+
+data_path = '/Users/cindychen/Desktop/英才计划重开！/fluidity/圆柱绕流/'
+
+# create file path for all csv files. Store them in "files"
+files = []
+for i in range(102):
+    p1 = '12_'
+    p2 = str(i)
+    p3 = '.csv'
+    suffix = p1 + p2 + p3
+    files += [data_path + suffix]
+
+#Read csv from all the data path stored in files
+df_array = [] # this is the array to store all df read from csv files
+
+
+for i in range(len(files)):  # 使用 files 的长度
+        df_array.append(pd.read_csv(files[i])['Speed'])  # 只包含 Speed 列
+        df = pd.DataFrame(df_array) ###
+
+print("df shape is", df.shape)
+
+
+#加pca/scale+inverse
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.decomposition import PCA
+
+scaler = MinMaxScaler()
+scaled_data = scaler.fit_transform(df.values)
+
+pca = PCA(n_components=10)
+pca_result = pca.fit_transform(scaled_data)
+
+scaled_back = pca.inverse_transform(pca_result)
+
+original_data = scaler.inverse_transform(scaled_back)
+
+print(original_data.shape)
+print("Scale, PCA and inverse Done")
+
+
+#[[[1],[2],[3],[4],[5]]]- [6]
+#[[[2],[3],[4],[5],[6]]]- [7]
+def df_to_X_y (df, size=10):
+    df_as_np = df.to_numpy()
+    X=[]
+    y=[]
+    for i in range (len(df_array)-size):
+        row = df_as_np[i:i+size]
+        X.append(row)
+        label = df_as_np[i+size]
+        y.append(label)
+    return np.array(X),np.array(y)
+
+size = 10
+X, y = df_to_X_y(pd.DataFrame(original_data), size)
+print("X shape is", X.shape)
+print("y shape is", y.shape)
+print("shift done")
+
+
+#####
+X_train, y_train = X[:82], y[:82]
+X_test, y_test = X[81:90], y[81:90]
+
+####
+
+X_train = tf.convert_to_tensor(X_train)  
+y_train = tf.convert_to_tensor(y_train)
+X_test = tf.convert_to_tensor(X_test)  
+y_test = tf.convert_to_tensor(y_test)
+
+train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train)).batch(1)
+
+model = Sequential()
+model.add(LSTM(200, 
+               input_shape=(X_train.shape[1], X_train.shape[2])))
+model.add(Dense(1107))
+model.add(Dropout(0.001))
+model.compile(loss=MeanSquaredError(), 
+              optimizer=Adam(learning_rate=0.0001), 
+              metrics=[RootMeanSquaredError()])
+epc=50
+model.fit(train_dataset, epochs=epc, batch_size=32,verbose=1)
+
+
+y_predicted = model.predict(X_test)
+
+rmse = sqrt(mean_squared_error(y_test, y_predicted))
+print("RMSE:", rmse)
+
+
+def triangles_to_edges(faces):
+    
+    edges = torch.cat([faces[:, 0:2],
+                       faces[:, 1:3],
+                       torch.stack([faces[:, 2], faces[:, 0]], axis=1)], dim=0)
+    receivers = tf.reduce_min(edges, axis=1)
+    senders = tf.reduce_max(edges, axis=1)
+    packed_edges = tf.bitcast(tf.stack([senders, receivers], axis=1), tf.int64)
+    df = pd.DataFrame(packed_edges)
+    unique_edges = df.drop_duplicates()
+    unique_edges = tf.convert_to_tensor(unique_edges)
+    senders, receivers = tf.unstack(unique_edges, axis=1)
+    return (tf.concat([senders, receivers], axis=0),
+          tf.concat([receivers, senders], axis=0))
+
+def get_dataset(path):
+    
+    vtu_files = sorted([f for f in os.listdir(path) if f.endswith('.vtu')])
+    print('文件数量为', len(vtu_files))
+
+    all_speed = []
+    
+    for filename in vtu_files:
+        mesh = meshio.read(os.path.join(path, filename))
+        Speed = torch.tensor(mesh.point_data["Speed"]).float()
+        all_speed.append(Speed)
+
+    Speed_combined = torch.vstack(all_speed)
+    print('合并后的矩阵规模为', Speed_combined.shape)
+    return Speed_combined, mesh
+
+def make_animation(mesh, speed_data):
+    
+    fig, ax = plt.subplots(1, 1, figsize=(20, 16))
+    ax.set_aspect('equal')
+    ax.set_axis_off()
+
+    pos = mesh.points[:, :2]
+    faces = mesh.get_cells_type('triangle')
+    triang = mtri.Triangulation(pos[:, 0], pos[:, 1], faces)
+
+    norm = colors.Normalize(vmin=speed_data.min(), vmax=speed_data.max())
+
+    mesh_plot = ax.tripcolor(triang, speed_data[0].numpy(), cmap='rainbow', norm=norm, shading='flat')
+    ax.triplot(triang, 'ko-', ms=0.5, lw=0.3)
+
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes('right', size='5%', pad=0.05)
+    clb = fig.colorbar(mesh_plot, ax=ax, cax=cax, orientation='vertical')
+    clb.ax.tick_params(labelsize=20)
+    clb.ax.set_title('Speed (m/s)', fontdict={'fontsize': 20})
+
+    def update(frame):
+        ax.cla() 
+        ax.set_aspect('equal')
+        ax.set_axis_off()
+        mesh_plot = ax.tripcolor(triang, speed_data[frame].numpy(), cmap='rainbow', norm=norm, shading='flat')
+        ax.triplot(triang, 'ko-', ms=0.5, lw=0.3)
+        return mesh_plot,
+    plt.close(fig)
+    ani = FuncAnimation(fig, update, frames=range(speed_data.shape[0]), blit=True, repeat=True)
+
+    return ani
+
+
+data_path = "/Users/cindychen/Desktop/英才计划重开！/fluidity/vtu文件/"
+
+speed_data, mesh = get_dataset(data_path)
+ani = make_animation(mesh, speed_data)
+
+y_predicted_tensor = torch.tensor(y_predicted).float() # 变成tensor
+ani_predicted = make_animation(mesh, y_predicted_tensor)
+
+error_data = y_test - y_predicted_tensor 
+error_data_numpy = error_data.numpy()
+error_data_tensor = torch.tensor(error_data_numpy).float()  # 先变成numpy再变成tensor
+    # EagerTensor 不能直接转换成 pytorch tensor，因为它是 tensorflow 的数据结构，和 pytorch tensor 不兼容
+ani_error = make_animation(mesh, error_data_tensor)
+
+
+from IPython.display import HTML
+from IPython.display import display
+
+display(HTML(ani.to_jshtml()))
+display(HTML(ani_predicted.to_jshtml()))
+display(HTML(ani_error.to_jshtml()))
